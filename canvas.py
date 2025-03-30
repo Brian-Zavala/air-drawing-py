@@ -4,20 +4,27 @@ os.environ["XDG_SESSION_TYPE"] = "x11"
 import numpy as np
 import cv2
 from collections import deque
+import mediapipe as mp
+import time
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+mp_drawing = mp.solutions.drawing_utils
 
 # Default callback function for trackbars
 def setValues(x):
     pass
 
-# Create the HSV trackbar window with wider default range
-cv2.namedWindow("Color detectors")
-cv2.createTrackbar("Upper Hue", "Color detectors", 180, 180, setValues)  # Max hue
-cv2.createTrackbar("Upper Saturation", "Color detectors", 255, 255, setValues)
-cv2.createTrackbar("Upper Value", "Color detectors", 255, 255, setValues)
-cv2.createTrackbar("Lower Hue", "Color detectors", 0, 180, setValues)    # Min hue
-cv2.createTrackbar("Lower Saturation", "Color detectors", 50, 255, setValues)
-cv2.createTrackbar("Lower Value", "Color detectors", 50, 255, setValues)
-cv2.createTrackbar("Brush Size", "Color detectors", 3, 15, setValues)    # Increased max brush size
+# Create the control window
+cv2.namedWindow("Controls")
+cv2.createTrackbar("Brush Size", "Controls", 3, 15, setValues)
+cv2.createTrackbar("Smoothing", "Controls", 5, 10, setValues)  # Added smoothing control
 
 # Try to load the webcam
 cap = cv2.VideoCapture(0)
@@ -45,9 +52,6 @@ color_names = ["BLUE", "GREEN", "RED", "YELLOW", "CYAN", "MAGENTA", "PURPLE", "B
 color_points = [deque(maxlen=1024) for _ in range(len(colors))]
 color_index = 0
 
-# The kernel for dilation 
-kernel = np.ones((5, 5), np.uint8)
-
 # Create large canvas
 paintWindow = np.zeros((paint_height, paint_width, 3)) + 255
 cv2.namedWindow('Paint', cv2.WINDOW_NORMAL)
@@ -59,6 +63,15 @@ is_fullscreen = False
 # Calculate UI dimensions
 ui_height = 65
 button_width = webcam_width // (len(colors) + 1)  # +1 for CLEAR ALL button
+
+# Create a smoothing buffer for drawing points (for friction effect)
+smoothing_buffer_x = deque(maxlen=10)
+smoothing_buffer_y = deque(maxlen=10)
+
+# Last point for distance calculation
+last_point = None
+last_draw_time = time.time()
+is_drawing = False
 
 # Function to save the drawing
 def save_drawing(paintWindow):
@@ -75,20 +88,20 @@ def save_drawing(paintWindow):
     cv2.imshow("Paint", temp)
     cv2.waitKey(1000)  # Display the message for 1 second
     cv2.imshow("Paint", paintWindow)
-    
+
 # Add auto-calibration feature to track min/max coordinates
 class Calibration:
     def __init__(self):
-        self.min_x = float('inf')
-        self.min_y = float('inf')
-        self.max_x = 0
-        self.max_y = 0
-        self.calibration_mode = True  # Start in calibration mode
-        self.points = []  # Store calibration points
+        self.min_x = 0.2  # Start with some reasonable defaults (20% from edge)
+        self.min_y = 0.2
+        self.max_x = 0.8  # 80% of width
+        self.max_y = 0.8
+        self.calibration_mode = False
+        self.points = []
         
-    def update(self, x, y, y_threshold):
+    def update(self, x, y):
         """Update calibration with new point if in calibration mode"""
-        if not self.calibration_mode or y <= y_threshold:
+        if not self.calibration_mode:
             return
             
         # Store the point for later processing
@@ -103,43 +116,67 @@ class Calibration:
     def finish_calibration(self):
         """Complete calibration and lock in the boundaries"""
         self.calibration_mode = False
-        
-        # Ensure we have valid bounds
-        if not self.has_data():
-            # Set some reasonable defaults if we don't have good data
-            width = webcam_width
-            height = webcam_height - ui_height
-            self.min_x = 0
-            self.min_y = ui_height
-            self.max_x = width 
-            self.max_y = height
-            
         print(f"Calibration complete! Tracking area set to: {self.min_x},{self.min_y} to {self.max_x},{self.max_y}")
         
     def reset(self):
         """Reset calibration and start over"""
-        self.min_x = float('inf')
-        self.min_y = float('inf')
-        self.max_x = 0
-        self.max_y = 0
+        self.min_x = 0.2
+        self.min_y = 0.2
+        self.max_x = 0.8
+        self.max_y = 0.8
         self.calibration_mode = True
         self.points = []
-        
-    def has_data(self):
-        """Check if we have enough calibration data"""
-        return (self.max_x > self.min_x + 50 and 
-                self.max_y > self.min_y + 50)
                 
     def get_x_range(self):
         """Get X range with safety check"""
-        return max(self.max_x - self.min_x, 1)  # Prevent division by zero
+        return max(self.max_x - self.min_x, 0.1)  # Prevent division by zero
         
     def get_y_range(self):
         """Get Y range with safety check"""
-        return max(self.max_y - self.min_y, 1)  # Prevent division by zero
+        return max(self.max_y - self.min_y, 0.1)  # Prevent division by zero
 
-# Create calibration object
+# Create calibration object using normalized coordinates (0-1) instead of pixels
 calibration = Calibration()
+
+# Function to detect hand gesture (open/closed)
+def detect_drawing_gesture(hand_landmarks):
+    """
+    Detect if the hand is in a drawing gesture
+    Uses distance between index fingertip and thumb tip
+    """
+    if not hand_landmarks:
+        return False
+    
+    # Get coordinates of index finger tip and thumb tip
+    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    
+    # Calculate distance between fingertips
+    distance = np.sqrt((index_tip.x - thumb_tip.x)**2 + (index_tip.y - thumb_tip.y)**2)
+    
+    # If distance is small enough, consider it a pinch/drawing gesture
+    return distance < 0.1  # Threshold can be adjusted
+
+# Function to get smoothed drawing point
+def get_smoothed_point(x, y, smoothing_factor):
+    """Apply smoothing to make drawing have 'friction'"""
+    # Add point to buffer
+    smoothing_buffer_x.append(x)
+    smoothing_buffer_y.append(y)
+    
+    # Calculate average (smoothed) position
+    if len(smoothing_buffer_x) < 2:
+        return x, y
+    
+    # Apply weighted average based on smoothing factor
+    # Higher smoothing = more previous points influence = more lag/friction
+    weight_current = 1 - (smoothing_factor / 10)
+    weight_prev = smoothing_factor / 10
+    
+    x_smooth = x * weight_current + np.mean(list(smoothing_buffer_x)[:-1]) * weight_prev
+    y_smooth = y * weight_current + np.mean(list(smoothing_buffer_y)[:-1]) * weight_prev
+    
+    return int(x_smooth), int(y_smooth)
 
 # Main loop
 try:
@@ -152,22 +189,19 @@ try:
         
         # Flipping the frame to see same side of yours
         frame = cv2.flip(frame, 1)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # Getting trackbar positions for HSV values
-        u_hue = cv2.getTrackbarPos("Upper Hue", "Color detectors")
-        u_saturation = cv2.getTrackbarPos("Upper Saturation", "Color detectors")
-        u_value = cv2.getTrackbarPos("Upper Value", "Color detectors")
-        l_hue = cv2.getTrackbarPos("Lower Hue", "Color detectors")
-        l_saturation = cv2.getTrackbarPos("Lower Saturation", "Color detectors")
-        l_value = cv2.getTrackbarPos("Lower Value", "Color detectors")
-        brush_size = cv2.getTrackbarPos("Brush Size", "Color detectors")
-        if brush_size < 1:  # Ensure brush size is at least 1
+        
+        # Convert to RGB for MediaPipe
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Process with MediaPipe Hands
+        results = hands.process(rgb_frame)
+        
+        # Get current controls
+        brush_size = cv2.getTrackbarPos("Brush Size", "Controls")
+        smoothing_factor = cv2.getTrackbarPos("Smoothing", "Controls")
+        if brush_size < 1:
             brush_size = 1
             
-        Upper_hsv = np.array([u_hue, u_saturation, u_value])
-        Lower_hsv = np.array([l_hue, l_saturation, l_value])
-
         # Draw UI buttons on the frame
         # Clear All button
         frame = cv2.rectangle(frame, (0, 0), (button_width, ui_height), 
@@ -175,10 +209,6 @@ try:
         cv2.putText(frame, "CLEAR ALL", (10, 33),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 255, 255), 2, cv2.LINE_AA)
-                    
-        # Add a small guide in the bottom corner to help with calibration
-        cv2.putText(frame, "Move to all corners to calibrate", (10, webcam_height-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
         
         # Color buttons
         for i in range(len(colors)):
@@ -194,83 +224,91 @@ try:
             cv2.putText(frame, color_names[i], (start_x + 10, 33),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         text_color, 2, cv2.LINE_AA)
-
-        # Create a mask for the colored pointer with enhanced processing
-        Mask = cv2.inRange(hsv, Lower_hsv, Upper_hsv)
         
-        # Apply more aggressive morphological operations to enhance detection
-        # First erode to remove small noise
-        Mask = cv2.erode(Mask, kernel, iterations=1)
-        # Then open to further remove noise
-        Mask = cv2.morphologyEx(Mask, cv2.MORPH_OPEN, kernel)
-        # Dilate more aggressively to enlarge the detected area
-        Mask = cv2.dilate(Mask, kernel, iterations=2)
-        
-        # Add text to Mask window to show current HSV values
-        mask_info = f"HSV Range: [{l_hue},{l_saturation},{l_value}] to [{u_hue},{u_saturation},{u_value}]"
-        cv2.putText(Mask, mask_info, (10, 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1, cv2.LINE_AA)
-
-        # Find contours for the pointer
-        cnts, _ = cv2.findContours(Mask.copy(), cv2.RETR_EXTERNAL,
-                                  cv2.CHAIN_APPROX_SIMPLE)
+        # Hand landmark processing
         center = None
-
-        # If contours are found
-        if len(cnts) > 0:
-            # Get the largest contour
-            cnt = sorted(cnts, key=cv2.contourArea, reverse=True)[0]
-            
-            # Get the radius of the enclosing circle around the contour
-            ((x, y), radius) = cv2.minEnclosingCircle(cnt)
-            
-            # Draw the circle around the contour
-            cv2.circle(frame, (int(x), int(y)), int(radius), (0, 255, 255), 2)
-            
-            # Calculate the center of the contour
-            M = cv2.moments(cnt)
-            if M['m00'] != 0:  # Prevent division by zero
-                center = (int(M['m10'] / M['m00']), int(M['m01'] / M['m00']))
+        drawing_gesture = False
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Draw hand landmarks for visual feedback
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    mp_hands.HAND_CONNECTIONS)
+                
+                # Check for drawing gesture
+                drawing_gesture = detect_drawing_gesture(hand_landmarks)
+                
+                # Get index finger tip as pointer
+                index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                
+                # Convert normalized coordinates to pixel values
+                x, y = int(index_tip.x * webcam_width), int(index_tip.y * webcam_height)
+                
+                # Draw circle at index finger tip
+                circle_color = (0, 255, 0) if drawing_gesture else (0, 0, 255)
+                cv2.circle(frame, (x, y), 10, circle_color, -1)
+                
+                # Update center point
+                center = (x, y)
                 
                 # Update calibration with current point
-                calibration.update(center[0], center[1], ui_height)
-                    
-                # Print calibration info occasionally for debugging
-                if center[0] % 100 == 0 and center[1] % 100 == 0:
-                    print(f"Calibration: X range [{calibration.min_x}-{calibration.max_x}], Y range [{calibration.min_y}-{calibration.max_y}]")
-            else:
-                center = None
-
-            # Check if user clicked on any UI buttons
-            if center and center[1] <= ui_height:
-                if 0 <= center[0] <= button_width:  # Clear All button
-                    for i in range(len(colors)):
-                        color_points[i] = deque(maxlen=1024)
-                    paintWindow[:] = 255  # Clear the entire canvas
-                else:
-                    # Check which color button was pressed
-                    for i in range(len(colors)):
-                        start_x = (i + 1) * button_width
-                        end_x = (i + 2) * button_width
-                        if end_x > webcam_width:
-                            end_x = webcam_width
-                            
-                        if start_x <= center[0] <= end_x:
-                            color_index = i
-                            break
-            # Add the current center to the active color's points
-            # Only add points if they're in the drawing area (below UI)
-            elif center and center[1] > ui_height:
-                # Store the original webcam coordinates for drawing
-                color_points[color_index].appendleft(center)
+                calibration.update(index_tip.x, index_tip.y)  # Using normalized coordinates
                 
-                # Draw a small indicator on the tracking window to show the actual drawing position
-                cv2.circle(frame, center, 5, colors[color_index], -1)
+                # Add gesture status text
+                gesture_text = "DRAWING" if drawing_gesture else "NOT DRAWING"
+                cv2.putText(frame, gesture_text, (x - 50, y - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, circle_color, 2, cv2.LINE_AA)
+        
+        # Check if user clicked on any UI buttons
+        if center and center[1] <= ui_height and drawing_gesture:
+            if 0 <= center[0] <= button_width:  # Clear All button
+                for i in range(len(colors)):
+                    color_points[i] = deque(maxlen=1024)
+                paintWindow[:] = 255  # Clear the entire canvas
+            else:
+                # Check which color button was pressed
+                for i in range(len(colors)):
+                    start_x = (i + 1) * button_width
+                    end_x = (i + 2) * button_width
+                    if end_x > webcam_width:
+                        end_x = webcam_width
+                        
+                    if start_x <= center[0] <= end_x:
+                        color_index = i
+                        break
+        
+        # Process drawing based on gesture
+        if center and center[1] > ui_height:
+            # Apply smoothing for "friction" effect
+            smoothed_x, smoothed_y = get_smoothed_point(center[0], center[1], smoothing_factor)
+            smoothed_center = (smoothed_x, smoothed_y)
+            
+            if drawing_gesture:
+                if not is_drawing:
+                    # Just started drawing
+                    is_drawing = True
+                    # Reset last point to avoid jumps
+                    last_point = smoothed_center
+                
+                # Only add the point if we're drawing
+                color_points[color_index].appendleft(smoothed_center)
+                
+                # Draw the point on the webcam frame
+                cv2.circle(frame, smoothed_center, 5, colors[color_index], -1)
+            else:
+                if is_drawing:
+                    # Just stopped drawing
+                    is_drawing = False
+                
+                # Add None to create a break in the line
+                color_points[color_index].appendleft(None)
         else:
-            # If no contour is found, add a new deque for continuous drawing
+            # If no hand is detected, add None to create a break in the line
             for i in range(len(colors)):
                 color_points[i].appendleft(None)
-
+        
         # Draw lines of all colors on the canvas and frame
         for i in range(len(colors)):
             points = list(color_points[i])
@@ -281,26 +319,24 @@ try:
                 # Draw on the webcam frame
                 cv2.line(frame, points[j - 1], points[j], colors[i], brush_size)
                 
-                # Don't draw during calibration mode
-                if not calibration.calibration_mode:
-                    # Use calibration data for scaling
-                    scaled_point1 = (
-                        int((points[j - 1][0] - calibration.min_x) * paint_width / calibration.get_x_range()),
-                        int(((points[j - 1][1] - calibration.min_y) * (paint_height - 30) / calibration.get_y_range()) + 30)
-                    )
-                    scaled_point2 = (
-                        int((points[j][0] - calibration.min_x) * paint_width / calibration.get_x_range()),
-                        int(((points[j][1] - calibration.min_y) * (paint_height - 30) / calibration.get_y_range()) + 30)
-                    )
-                    
-                    # Draw on the paint window with scaled brush size
-                    scaled_brush_size = int(brush_size * paint_width / webcam_width)
-                    if scaled_brush_size < 1:
-                        scaled_brush_size = 1
-                    cv2.line(paintWindow, scaled_point1, scaled_point2, colors[i], scaled_brush_size)
+                # Scale the points to the paint window size
+                scaled_point1 = (
+                    int(points[j - 1][0] * paint_width / webcam_width),
+                    int(points[j - 1][1] * paint_height / webcam_height)
+                )
+                scaled_point2 = (
+                    int(points[j][0] * paint_width / webcam_width),
+                    int(points[j][1] * paint_height / webcam_height)
+                )
+                
+                # Draw on the paint window with scaled brush size
+                scaled_brush_size = int(brush_size * 1.5)  # Make brush slightly bigger on canvas
+                if scaled_brush_size < 1:
+                    scaled_brush_size = 1
+                cv2.line(paintWindow, scaled_point1, scaled_point2, colors[i], scaled_brush_size)
 
         # Add a small info panel to the paint window
-        info_text = f"Current Color: {color_names[color_index]} | Brush Size: {brush_size} | Press 's' to save, 'c' to clear, 'f' for fullscreen, 'r' to recalibrate, 'q' to quit"
+        info_text = f"Current Color: {color_names[color_index]} | Brush Size: {brush_size} | Smoothing: {smoothing_factor} | Press 's' to save, 'c' to clear, 'f' for fullscreen, 'r' to recalibrate, 'q' to quit"
         cv2.rectangle(paintWindow, (0, 0), (paint_width, 30), (220, 220, 220), -1)
         cv2.putText(paintWindow, info_text, (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -312,48 +348,6 @@ try:
         # Display windows
         cv2.imshow("Tracking", frame)
         cv2.imshow("Paint", paintWindow)
-        cv2.imshow("Mask", Mask)
-
-        # Display info about calibration mode
-        if calibration.calibration_mode:
-            # Draw large text indicating calibration mode
-            cv2.rectangle(frame, (10, webcam_height//2-40), (webcam_width-10, webcam_height//2+40), (0, 0, 0), -1)
-            cv2.putText(frame, "CALIBRATION MODE", (webcam_width//4, webcam_height//2-10),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, "Move marker to all 4 corners", (webcam_width//5, webcam_height//2+20),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-            
-            # Draw corner targets to show where to move
-            corner_size = 30
-            # Top-left corner
-            cv2.rectangle(frame, (0, ui_height), (corner_size, ui_height+corner_size), (0, 255, 0), 2)
-            # Top-right corner
-            cv2.rectangle(frame, (webcam_width-corner_size, ui_height), (webcam_width, ui_height+corner_size), (0, 255, 0), 2)
-            # Bottom-left corner
-            cv2.rectangle(frame, (0, webcam_height-corner_size), (corner_size, webcam_height), (0, 255, 0), 2)
-            # Bottom-right corner
-            cv2.rectangle(frame, (webcam_width-corner_size, webcam_height-corner_size), (webcam_width, webcam_height), (0, 255, 0), 2)
-            
-            # Show instruction to press SPACE when done
-            cv2.putText(frame, "Press SPACE when done calibrating", (webcam_width//5, webcam_height-10),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                      
-            # Draw current calibration points
-            for point in calibration.points[-20:]:  # Show last 20 points
-                cv2.circle(frame, point, 2, (0, 255, 255), -1)
-        else:
-            # Show the fixed calibration area
-            cv2.rectangle(frame, 
-                         (calibration.min_x, calibration.min_y), 
-                         (calibration.max_x, calibration.max_y), 
-                         (0, 255, 0), 1)
-            
-            # Show calibration info
-            cv2.putText(frame, "DRAWING MODE", (webcam_width//3, webcam_height-50),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            calibration_text = f"Tracking: {calibration.min_x},{calibration.min_y} to {calibration.max_x},{calibration.max_y}"
-            cv2.putText(frame, calibration_text, (10, webcam_height-30),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
         
         # Handle keyboard inputs
         key = cv2.waitKey(1) & 0xFF
@@ -379,13 +373,7 @@ try:
                 cv2.resizeWindow('Paint', paint_width, paint_height)
         elif key == ord("r"):  # Reset calibration
             calibration.reset()
-            print("Calibration reset. Move your marker across the entire screen to recalibrate.")
-        elif key == 32:  # Space bar - finish calibration
-            if calibration.calibration_mode:
-                calibration.finish_calibration()
-                for i in range(len(colors)):
-                    color_points[i] = deque(maxlen=1024)  # Clear any points collected during calibration
-                paintWindow[:] = 255  # Clear the canvas
+            print("Calibration reset. Move your hand across the entire screen to recalibrate.")
 
 except Exception as e:
     print(f"An error occurred: {e}")
@@ -393,3 +381,4 @@ finally:
     # Release resources
     cap.release()
     cv2.destroyAllWindows()
+    hands.close()
