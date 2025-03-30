@@ -179,6 +179,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-Created by [Your Name] - [Your Website/GitHub]
+Created by Brian Zavala
 
 If you find this project useful, please consider giving it a star ⭐
