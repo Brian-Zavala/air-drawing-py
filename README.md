@@ -33,7 +33,7 @@ A computer vision-based drawing application that allows users to create digital 
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/airdraw.git
+   git clone https://github.com/Brian-Zavala/airdraw.git
    cd airdraw
    ```
 
