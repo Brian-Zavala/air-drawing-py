@@ -22,8 +22,8 @@ mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,            # Process only one hand
-    min_detection_confidence=0.6, # Slightly higher confidence
-    min_tracking_confidence=0.6  # Slightly higher confidence
+    min_detection_confidence=0.5, # Slightly higher confidence
+    min_tracking_confidence=0.5  # Slightly higher confidence
 )
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles # For better landmark drawing
@@ -225,7 +225,7 @@ def detect_drawing_gesture(hand_landmarks):
         # finger_straight = dist_tip_wrist > dist_mcp_wrist # Basic check
 
         # Simple Pinch: Index and Thumb tips are close
-        is_pinching = pinch_distance < 0.07 # Adjust threshold based on testing
+        is_pinching = pinch_distance < 0.1 # Adjust threshold based on testing
 
         return is_pinching
 
